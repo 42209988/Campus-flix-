@@ -120,8 +120,11 @@ function generateTicketQR(ticketId) {
 // Middleware
 // ---------------------------------------------------------------------------
 function requireAdmin(req, res, next) {
-  if (req.session && req.session.isAdmin) return next();
-  res.status(401).json({ error: 'Not logged in' });
+  // Login disabled — anyone with the /admin.html link can manage shows.
+  // To bring login back later, restore the session check below:
+  // if (req.session && req.session.isAdmin) return next();
+  // return res.status(401).json({ error: 'Not logged in' });
+  next();
 }
 
 const upload = multer({
@@ -150,12 +153,8 @@ app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body;
   if (username !== process.env.ADMIN_USERNAME) return res.status(401).json({ error: 'Invalid username or password' });
   const hash = process.env.ADMIN_PASSWORD_HASH;
-  const plain = process.env.ADMIN_PASSWORD;
-  let valid = false;
-  if (hash) valid = await bcrypt.compare(password, hash);
-  else if (plain) valid = password === plain;
-  else return res.status(500).json({ error: 'Admin password not configured. See README.' });
-  if (!valid) return res.status(401).json({ error: 'Invalid username or password' });
+  if (!hash) return res.status(500).json({ error: 'Admin password not configured. See README.' });
+  if (!(await bcrypt.compare(password, hash))) return res.status(401).json({ error: 'Invalid username or password' });
   req.session.isAdmin = true;
   res.json({ ok: true });
 });
