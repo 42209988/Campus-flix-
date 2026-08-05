@@ -150,8 +150,12 @@ app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body;
   if (username !== process.env.ADMIN_USERNAME) return res.status(401).json({ error: 'Invalid username or password' });
   const hash = process.env.ADMIN_PASSWORD_HASH;
-  if (!hash) return res.status(500).json({ error: 'Admin password not configured. See README.' });
-  if (!(await bcrypt.compare(password, hash))) return res.status(401).json({ error: 'Invalid username or password' });
+  const plain = process.env.ADMIN_PASSWORD;
+  let valid = false;
+  if (hash) valid = await bcrypt.compare(password, hash);
+  else if (plain) valid = password === plain;
+  else return res.status(500).json({ error: 'Admin password not configured. See README.' });
+  if (!valid) return res.status(401).json({ error: 'Invalid username or password' });
   req.session.isAdmin = true;
   res.json({ ok: true });
 });
