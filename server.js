@@ -8,7 +8,8 @@ require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const QRCode = require('qrcode');
+const PDFDocument = require('pdfkit');
+const nodemailer = require('nodemailer');
 const multer = require('multer');
 const { nanoid } = require('nanoid');
 const fs = require('fs');
@@ -112,8 +113,67 @@ async function initiateSTKPush({ phone, amount, accountReference, description })
   return data;
 }
 
-function generateTicketQR(ticketId) {
-  return QRCode.toDataURL(ticketId, { margin: 1, width: 300, color: { dark: '#221a12', light: '#ece3cd' } });
+// Builds a simple, clean PDF ticket receipt in memory and returns it as a Buffer.
+function generateReceiptPDF({ ticket, show }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A5', margin: 40 });
+    const chunks = [];
+    doc.on('data', c => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.rect(0, 0, doc.page.width, 90).fill('#0b0908');
+    doc.fillColor('#c31f2a').font('Helvetica-Bold').fontSize(22).text('CAMPUS', 40, 32, { continued: true });
+    doc.fillColor('#ffffff').text('FLIX');
+    doc.fillColor('#e6ab35').font('Helvetica').fontSize(10).text('E-TICKET RECEIPT', 40, 62);
+
+    doc.moveDown(3);
+    doc.fillColor('#111111').font('Helvetica-Bold').fontSize(20).text(show.title, 40, 120);
+    doc.font('Helvetica').fontSize(11).fillColor('#444444');
+    doc.moveDown(0.5);
+    doc.text(`Category: ${show.type}`);
+    doc.text(`Venue: ${show.venue}`);
+    doc.text(`Date: ${show.date}   Time: ${show.time}`);
+
+    doc.moveDown(1);
+    doc.moveTo(40, doc.y).lineTo(doc.page.width - 40, doc.y).dash(3, { space: 3 }).strokeColor('#999999').stroke();
+    doc.undash();
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Ticket Holder');
+    doc.font('Helvetica').fontSize(11).fillColor('#444444').text(ticket.name);
+    doc.moveDown(0.5);
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Quantity');
+    doc.font('Helvetica').fontSize(11).fillColor('#444444').text(`${ticket.quantity} ticket${ticket.quantity > 1 ? 's' : ''}`);
+    doc.moveDown(0.5);
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Amount Paid');
+    doc.font('Helvetica').fontSize(11).fillColor('#444444').text(`KES ${ticket.amount}`);
+    doc.moveDown(0.5);
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#111111').text('Receipt No.');
+    doc.font('Helvetica').fontSize(11).fillColor('#444444').text(ticket.id.toUpperCase());
+
+    doc.moveDown(1.5);
+    doc.font('Helvetica-Oblique').fontSize(9).fillColor('#888888')
+      .text('Present this receipt (printed or on your phone) at the door. Non-refundable once used.', { width: doc.page.width - 80 });
+
+    doc.end();
+  });
+}
+
+// Emails the PDF receipt to the buyer using Gmail SMTP.
+async function sendTicketEmail({ to, name, show, pdfBuffer }) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASSWORD }
+  });
+
+  await transporter.sendMail({
+    from: `"CampusFlix" <${process.env.EMAIL_USER}>`,
+    to,
+    subject: `Your CampusFlix Ticket — ${show.title}`,
+    text: `Hi ${name},\n\nYour ticket for ${show.title} is attached as a PDF. See you there!\n\n— CampusFlix`,
+    attachments: [{ filename: `campusflix-ticket-${show.title.replace(/\s+/g, '-').toLowerCase()}.pdf`, content: pdfBuffer }]
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -208,9 +268,9 @@ app.delete('/api/shows/admin/:id', requireAdmin, (req, res) => { Shows.delete(re
 // ---------------------------------------------------------------------------
 app.post('/api/tickets/purchase', async (req, res) => {
   try {
-    const { showId, name, phone, quantity } = req.body;
+    const { showId, name, phone, email, quantity } = req.body;
     const qty = Number(quantity) || 1;
-    if (!showId || !name || !phone) return res.status(400).json({ error: 'Missing name, phone, or show' });
+    if (!showId || !name || !phone || !email) return res.status(400).json({ error: 'Missing name, phone, email, or show' });
 
     const show = Shows.find(showId);
     if (!show || show.status !== 'live') return res.status(404).json({ error: 'Show not found' });
@@ -220,7 +280,7 @@ app.post('/api/tickets/purchase', async (req, res) => {
 
     const amount = show.price * qty;
     const ticket = Tickets.create({
-      id: nanoid(12), showId, name, phone, quantity: qty, amount,
+      id: nanoid(12), showId, name, phone, email, quantity: qty, amount,
       status: 'pending', checkoutRequestId: null, createdAt: new Date().toISOString()
     });
 
@@ -237,7 +297,7 @@ app.post('/api/tickets/purchase', async (req, res) => {
 app.get('/api/tickets/:id/status', (req, res) => {
   const ticket = Tickets.find(req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-  res.json({ status: ticket.status });
+  res.json({ status: ticket.status, emailError: ticket.emailError || false });
 });
 
 app.get('/api/tickets/:id', (req, res) => {
@@ -257,9 +317,19 @@ app.post('/api/mpesa/callback', async (req, res) => {
     if (!ticket) { console.warn('No ticket for', CheckoutRequestID); return res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); }
 
     if (ResultCode === 0) {
-      const qrCode = await generateTicketQR(ticket.id);
-      Tickets.update(ticket.id, { status: 'paid', qrCode });
+      Tickets.update(ticket.id, { status: 'paid' });
       Shows.incrementSold(ticket.showId, ticket.quantity);
+
+      // Build the PDF and email it. If email fails, the ticket is still
+      // valid/paid — we just flag it so the confirmation page can offer a retry.
+      try {
+        const show = Shows.find(ticket.showId);
+        const pdfBuffer = await generateReceiptPDF({ ticket, show });
+        await sendTicketEmail({ to: ticket.email, name: ticket.name, show, pdfBuffer });
+      } catch (emailErr) {
+        console.error('Email send error:', emailErr);
+        Tickets.update(ticket.id, { emailError: true });
+      }
     } else {
       Tickets.update(ticket.id, { status: 'failed' });
     }
@@ -270,12 +340,20 @@ app.post('/api/mpesa/callback', async (req, res) => {
   }
 });
 
-app.post('/api/tickets/admin/verify', requireAdmin, (req, res) => {
-  const ticket = Tickets.find(req.body.ticketId);
-  if (!ticket || ticket.status === 'pending' || ticket.status === 'failed') return res.status(404).json({ valid: false, reason: 'Ticket not found' });
-  if (ticket.status === 'used') return res.json({ valid: false, reason: 'Already used', ticket });
-  Tickets.update(ticket.id, { status: 'used', usedAt: new Date().toISOString() });
-  res.json({ valid: true, ticket });
+// Lets the confirmation page offer a "resend" if the first email attempt failed.
+app.post('/api/tickets/:id/resend', async (req, res) => {
+  try {
+    const ticket = Tickets.find(req.params.id);
+    if (!ticket || ticket.status !== 'paid') return res.status(404).json({ error: 'Ticket not found' });
+    const show = Shows.find(ticket.showId);
+    const pdfBuffer = await generateReceiptPDF({ ticket, show });
+    await sendTicketEmail({ to: ticket.email, name: ticket.name, show, pdfBuffer });
+    Tickets.update(ticket.id, { emailError: false });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Resend error:', err);
+    res.status(500).json({ error: 'Could not resend email' });
+  }
 });
 
 app.listen(PORT, () => console.log(`CampusFlix running on http://localhost:${PORT}`));
